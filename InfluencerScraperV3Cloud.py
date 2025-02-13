@@ -1,4 +1,5 @@
 import streamlit as st
+#from apify_client import ApifyClient  # Keep this import if you need to use the client functions
 import openai
 from apify_client import ApifyClient
 import gspread
@@ -18,7 +19,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Set up your OpenAI API key from secrets
+# Set up your OpenAI API key from secrets (if needed elsewhere)
 openai.api_key = st.secrets["openai"]["api_key"]
 
 # Apify token from secrets
@@ -65,7 +66,7 @@ try:
     logging.info("Hashtags worksheet found.")
 except Exception:
     hashtag_worksheet = sh.add_worksheet(title="Hashtags", rows=1000, cols=10)
-    hashtag_header = ["Timestamp", "Keywords Entered", "Generated Hashtags"]
+    hashtag_header = ["Timestamp", "Hashtags Entered", "Used Hashtags"]
     hashtag_worksheet.insert_row(hashtag_header, 1)
     logging.info("Hashtags worksheet created with header row.")
 
@@ -73,40 +74,14 @@ except Exception:
 # 2. HELPER FUNCTIONS
 # ---------------------------------------------------
 
-def generate_hashtags_from_openai(keywords: str) -> list:
+def append_hashtags_to_sheet(input_str: str, hashtags: list):
     """
-    Call OpenAI to generate 50 Instagram hashtags associated with the user's input keywords.
-    Updated for the ed-tech / International Baccalaureate use case.
-    """
-    try:
-        prompt = (
-            f"Generate 50 Instagram hashtags associated with the following keywords: {keywords}. "
-            "Please ensure these hashtags are popular among content creators who post ed-tech and International Baccalaureate-related content. "
-            "These hashtags should be used by influencers internationally, including in non-English languages (e.g. Polish, Dutch, French). "
-            "Output these in a comma-separated list without extra commentary."
-        )
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.7
-        )
-        raw_text = response["choices"][0]["message"]["content"].strip()
-        hashtags = [tag.strip() for tag in raw_text.split(",")]
-        hashtags = [h for h in hashtags if h]
-        return hashtags
-    except Exception as e:
-        logging.error(f"Error generating hashtags from OpenAI: {e}")
-        return []
-
-def append_hashtags_to_sheet(keywords: str, hashtags: list):
-    """
-    Store the generated hashtags in the 'Hashtags' worksheet.
+    Store the entered hashtags in the 'Hashtags' worksheet.
     """
     from datetime import datetime
     try:
         hashtags_str = ", ".join(hashtags)
-        row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), keywords, hashtags_str]
+        row = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), input_str, hashtags_str]
         hashtag_worksheet.append_row(row)
         logging.info("Hashtags appended to 'Hashtags' worksheet.")
     except Exception as e:
@@ -150,7 +125,6 @@ def user_already_in_sheet(username: str) -> bool:
 def scrape_profile_info(username: str):
     """
     Scrape Instagram profile info using Apify and return the profile data as a dictionary.
-    (Does not append data to the sheet yet.)
     """
     client = ApifyClient(APIFY_API_TOKEN)
     try:
@@ -226,31 +200,32 @@ def main():
     st.title("Instagram IB Influencer Sourcing Automation")
     
     st.write(
-        "Please enter comma-separated keywords (e.g. `International Baccalaureate, IB exam, IB study tips, exam prep, global education`):"
+        "Please enter comma-separated hashtags (e.g. #InternationalBaccalaureate, #IBExams, #IBDiploma):"
     )
-    keywords_input = st.text_input("Keywords", "")
+    hashtags_input = st.text_input("Hashtags", "")
     
     results_limit = st.number_input("How many posts per hashtag to scrape?", min_value=1, max_value=1000, value=50)
     
-    if st.button("Generate Hashtags & Scrape Influencers"):
-        if not keywords_input.strip():
-            st.error("Please enter at least one keyword.")
+    if st.button("Scrape Influencers"):
+        if not hashtags_input.strip():
+            st.error("Please enter at least one hashtag.")
             return
         
-        # Step A: Generate hashtags via OpenAI
-        hashtags = generate_hashtags_from_openai(keywords_input)
+        # Parse the direct hashtags provided by the user
+        hashtags = [tag.strip() for tag in hashtags_input.split(",") if tag.strip()]
         if not hashtags:
-            st.error("No hashtags generated. Please check logs.")
+            st.error("No valid hashtags entered.")
             return
-        st.success(f"Generated {len(hashtags)} hashtags.")
         
-        # Step B: Append hashtags to the Hashtags worksheet
-        append_hashtags_to_sheet(keywords_input, hashtags)
+        st.success(f"Using {len(hashtags)} hashtags: {', '.join(hashtags)}")
         
-        # Step C: Fetch unique owner usernames from the scraped hashtags
+        # Append the entered hashtags to the Hashtags worksheet
+        append_hashtags_to_sheet(hashtags_input, hashtags)
+        
+        # Fetch unique owner usernames from the scraped hashtags
         unique_usernames = fetch_owner_usernames_from_hashtags(hashtags, results_limit)
         
-        # Step D: For each username, scrape profile info and apply filtering
+        # Process each username: scrape profile info, calculate engagement, and append qualifying profiles to the sheet.
         for username in unique_usernames:
             if user_already_in_sheet(username):
                 logging.info(f"Skipping {username}, already in sheet.")
@@ -260,7 +235,7 @@ def main():
             if profile_data is None:
                 continue
             
-            # Adjusted filter: For the IB/ed-tech space, lower the follower and post thresholds.
+            # Filtering criteria for the IB/ed-tech space: lower thresholds are applied.
             if profile_data["followers_count"] > 1000 and profile_data["posts_count"] > 5:
                 median_likes, median_comments = get_last_5_posts_stats(username, limit=30)
                 if profile_data["followers_count"] > 0:
@@ -268,12 +243,11 @@ def main():
                 else:
                     engagement_rate = 0
                 
-                # Adjusted engagement rate threshold to 0.5%
+                # Only include profiles with an engagement rate of at least 0.5%
                 if engagement_rate < 0.5:
                     logging.info(f"Skipping {username} due to low engagement rate: {engagement_rate:.2f}%")
                     continue
                 
-                # Append the qualifying profile to the Main worksheet
                 append_profile_to_sheet(profile_data, median_comments, median_likes, engagement_rate)
         
         st.success("Scraping and data append complete. Please check Google Sheets for results.")
